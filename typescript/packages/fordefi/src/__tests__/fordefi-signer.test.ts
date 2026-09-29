@@ -846,6 +846,34 @@ describe('createFordefiSigner', () => {
             );
         });
 
+        it('does not report a caller abort during preparation as unconfirmed', async () => {
+            const controller = new AbortController();
+            const reason = new Error('caller aborted');
+            const signer = await createFordefiSigner({
+                ...nativeConfig,
+                privateKeyPem: undefined,
+                requestSigner: {
+                    signRequest: () => {
+                        controller.abort(reason);
+                        return 'custom-sig-value';
+                    },
+                },
+            });
+            const mockTx = {
+                messageBytes: compiledMessageBytes(MOCK_ADDRESS),
+                signatures: { [MOCK_ADDRESS]: null },
+            } as never;
+
+            await expect(
+                signer.signAndSendTransactions([mockTx], { abortSignal: controller.signal }),
+            ).rejects.toMatchObject({
+                cause: reason,
+                code: SignerErrorCode.SIGNING_FAILED,
+                context: { failedIndex: 0 },
+            });
+            expect(fetch).not.toHaveBeenCalled();
+        });
+
         it('reports an accepted submit with no id as unconfirmed', async () => {
             const signer = await createFordefiSigner(nativeConfig);
             vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ state: 'pending' }), { status: 200 }));
