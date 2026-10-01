@@ -12,10 +12,14 @@ vi.mock('@solana/keychain-core', async importOriginal => {
 });
 
 const mockSend = vi.fn();
+const mockClientConfig = vi.fn();
 
 vi.mock('@aws-sdk/client-kms', () => {
     class MockKMSClient {
         send = mockSend;
+        constructor(config: unknown) {
+            mockClientConfig(config);
+        }
     }
 
     class MockSignCommand {
@@ -77,32 +81,7 @@ describe('createAwsKmsSigner', () => {
         vi.clearAllMocks();
     });
 
-    describe('basic construction', () => {
-        it('creates an AwsKmsSigner with valid config', async () => {
-            const keyPair = await generateKeyPairSigner();
-
-            const signer = createAwsKmsSigner({
-                keyId: TEST_KEY_ID,
-                publicKey: keyPair.address,
-            });
-
-            expect(signer.address).toBe(keyPair.address);
-            assertIsSolanaTransactionSigner(signer);
-        });
-
-        it('should throw error for missing keyId', async () => {
-            const keyPair = await generateKeyPairSigner();
-
-            expect(() => {
-                createAwsKmsSigner({
-                    keyId: '',
-                    publicKey: keyPair.address,
-                });
-            }).toThrow('Missing required keyId field');
-        });
-    });
-
-    describe('createAwsKmsSigner (additional cases)', () => {
+    describe('construction', () => {
         it('creates an AwsKmsSigner with valid config', async () => {
             const keyPair = await generateKeyPairSigner();
 
@@ -115,21 +94,6 @@ describe('createAwsKmsSigner', () => {
 
             expect(signer.address).toBe(keyPair.address);
             assertIsSolanaTransactionSigner(signer);
-            expect(signer.signMessages).toBeDefined();
-            expect(signer.signTransactions).toBeDefined();
-            expect(signer.isAvailable).toBeDefined();
-        });
-
-        it('sets address field correctly from config', async () => {
-            const keyPair = await generateKeyPairSigner();
-
-            const config: AwsKmsSignerConfig = {
-                keyId: TEST_KEY_ID,
-                publicKey: keyPair.address,
-            };
-
-            const signer = createAwsKmsSigner(config);
-            expect(signer.address).toBe(keyPair.address);
         });
 
         it('should throw error for missing keyId', async () => {
@@ -188,47 +152,17 @@ describe('createAwsKmsSigner', () => {
             warnSpy.mockRestore();
         });
 
-        it('should accept region configuration', async () => {
+        it('passes region and credentials to the KMS client', async () => {
             const keyPair = await generateKeyPairSigner();
+            const credentials = {
+                accessKeyId: 'test-access-key',
+                secretAccessKey: 'test-secret-key',
+                sessionToken: 'test-session-token',
+            };
 
-            const signer = createAwsKmsSigner({
-                keyId: TEST_KEY_ID,
-                publicKey: keyPair.address,
-                region: 'us-west-2',
-            });
+            createAwsKmsSigner({ credentials, keyId: TEST_KEY_ID, publicKey: keyPair.address, region: 'us-west-2' });
 
-            expect(signer).toBeDefined();
-        });
-
-        it('should accept credentials configuration', async () => {
-            const keyPair = await generateKeyPairSigner();
-
-            const signer = createAwsKmsSigner({
-                keyId: TEST_KEY_ID,
-                publicKey: keyPair.address,
-                credentials: {
-                    accessKeyId: 'test-access-key',
-                    secretAccessKey: 'test-secret-key',
-                },
-            });
-
-            expect(signer).toBeDefined();
-        });
-
-        it('should accept session token in credentials', async () => {
-            const keyPair = await generateKeyPairSigner();
-
-            const signer = createAwsKmsSigner({
-                keyId: TEST_KEY_ID,
-                publicKey: keyPair.address,
-                credentials: {
-                    accessKeyId: 'test-access-key',
-                    secretAccessKey: 'test-secret-key',
-                    sessionToken: 'test-session-token',
-                },
-            });
-
-            expect(signer).toBeDefined();
+            expect(mockClientConfig).toHaveBeenCalledWith({ credentials, region: 'us-west-2' });
         });
     });
 
