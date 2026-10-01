@@ -33,7 +33,7 @@ Only the backend a configuration dispatches to is bundled — backend packages a
 
 ## Managed-broadcast backends are excluded
 
-Crossmint, and Fordefi in native mode (`chain` set), rewrite and broadcast transactions server-side. They are Kit `TransactionSendingSigner`s with no `signTransactions`, so they cannot serve as a client `payer` or `identity` — client send flows build, sign, and broadcast themselves, and Kit routes a sending signer only through `signAndSendTransactionMessageWithSigners()`. These plugins reject such configs at compile time (`KeychainKitPluginConfig`). Use the signer directly instead:
+Crossmint and Fordefi native auto mode rewrite and broadcast transactions server-side, and Fordefi native manual mode rewrites the transaction before signing it. None of them has `signTransactions`, so they cannot serve as a client `payer` or `identity` — client send flows build, sign, and broadcast themselves, and Kit routes a sending signer only through `signAndSendTransactionMessageWithSigners()`. These plugins reject Crossmint and any Fordefi config with `chain` set at compile time (`KeychainKitPluginConfig`). Use the signer directly instead:
 
 ```ts
 import { signAndSendTransactionMessageWithSigners } from '@solana/signers';
@@ -41,6 +41,13 @@ import { createKeychainSigner } from '@solana/keychain';
 
 const crossmint = await createKeychainSigner({ backend: 'crossmint', apiKey, walletLocator });
 const signature = await signAndSendTransactionMessageWithSigners(transactionMessage);
+```
+
+Fordefi native manual mode does not broadcast. Sign with `modifyAndSignTransactions()`, then submit the transaction it returns, never the one you passed in:
+
+```ts
+const fordefi = await createKeychainSigner({ backend: 'fordefi', ...fordefiConfig, chain, pushMode: 'manual' });
+const [signedTransaction] = await fordefi.modifyAndSignTransactions([transaction]);
 ```
 
 Fordefi in black-box mode (no `chain`) is a regular partial signer and remains supported.
@@ -56,11 +63,13 @@ Fordefi in black-box mode (no `chain`) is a regular partial signer and remains s
 Mix backends on one client:
 
 ```ts
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { createClient } from '@solana/kit';
 import { keychainIdentity, keychainPayer } from '@solana/keychain-kit-plugin';
 
 const client = await createClient()
-    .use(keychainPayer({ backend: 'memory', privateKeyPath: '~/.config/solana/id.json' }))
+    .use(keychainPayer({ backend: 'memory', privateKeyPath: join(homedir(), '.config/solana/id.json') }))
     .use(keychainIdentity({ backend: 'turnkey', ...turnkeyConfig }));
 ```
 
