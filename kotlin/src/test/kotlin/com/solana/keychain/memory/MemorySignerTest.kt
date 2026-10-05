@@ -11,10 +11,29 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
+import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters
+import org.bouncycastle.crypto.signers.Ed25519Signer
 
 private const val ADDRESS = "9C6hybhQ6Aycep9jaUnP6uL9ZYvDjUp1aSkFWPUFJtpj"
 private const val MESSAGE_B64 = "AQABA3m1Vi6P5lT5QHixEuipi6eQH4U65pW+1+DjkQutBJZkIVL40Zt5HSRFMkLhXy6rbLfP+ntqXtMAl5YOBpiB2xIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJAQICAAEMAgAAAEBCDwAAAAAA"
 private const val SIGNED_TX_B64 = "AQUSPyADYLJarC6XLNhwmO1ZNP7/MECEKnIrOtFcIShPQX3yXWFNn9ftJEhqvrA0W01eyrBk8Pojgs+jRn23Nw4BAAEDebVWLo/mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQhUvjRm3kdJEUyQuFfLqtst8/6e2pe0wCXlg4GmIHbEgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkBAgIAAQwCAAAAQEIPAAAAAAA="
+
+private val CANONICAL_KEYPAIR_BYTES = listOf(
+    41, 99, 180, 88, 51, 57, 48, 80, 61, 63, 219, 75, 176, 49, 116, 254,
+    227, 176, 196, 204, 122, 47, 166, 133, 155, 252, 217, 0, 253, 17, 49, 143,
+    47, 94, 121, 167, 195, 136, 72, 22, 157, 48, 77, 88, 63, 96, 57, 122,
+    181, 243, 236, 188, 241, 134, 174, 224, 100, 246, 17, 170, 104, 17, 151, 48,
+).map(Int::toByte).toByteArray()
+private const val GOLDEN_PUBKEY = "4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR"
+private const val GOLDEN_MESSAGE_B64 =
+    "AQABAy9eeafDiEgWnTBNWD9gOXq18+y88Yau4GT2EapoEZcwAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC" +
+        "AgIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+        "AAAQICAAEMAgAAAEBCDwAAAAAA"
+private const val GOLDEN_SIGNED_TX_B64 =
+    "AaynSvis6Ib7Ryu0FHtVWQEOaHwqjVtlBUmx5dS8lnDzYlucZlaLBuiwHh2yKYxh9BpT4SnIu2Lkp+dmBFf9Igc" +
+        "BAAEDL155p8OISBadME1YP2A5erXz7Lzxhq7gZPYRqmgRlzACAgICAgICAgICAgICAgICAgICAgICAgICAgICAg" +
+        "ICAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+        "AAABAgIAAQwCAAAAQEIPAAAAAAA="
 
 private val seed = ByteArray(32) { (it + 1).toByte() }
 private val publicKey = Ed25519PrivateKeyParameters(seed, 0).generatePublicKey().encoded
@@ -29,6 +48,12 @@ private fun keypairFile(contents: String) = File.createTempFile("keypair", ".jso
 
 private fun assertRefused(code: String, block: () -> Unit) =
     assertEquals(code, assertFailsWith<SignerError> { block() }.code.value)
+
+private fun verifies(signature: ByteArray, message: ByteArray, pubkey: ByteArray) = Ed25519Signer().run {
+    init(false, Ed25519PublicKeyParameters(pubkey, 0))
+    update(message, 0, message.size)
+    verifySignature(signature)
+}
 
 class MemorySignerTest {
     @Test
@@ -92,8 +117,10 @@ class MemorySignerTest {
         val signer = MemorySigner.fromBytes(seed)
         val message = byteArrayOf(0x80.toByte(), 2, 0, 0, 2) + ByteArray(32) { 7 } + publicKey + ByteArray(32) + byteArrayOf(0, 0)
         val signed = signer.signTransaction(byteArrayOf(0) + message)
-        val expected = byteArrayOf(2) + ByteArray(64) + signer.signMessage(message) + message
-        assertContentEquals(expected, Base64.getDecoder().decode(signed.encodedTransaction))
+        val wire = Base64.getDecoder().decode(signed.encodedTransaction)
+        assertContentEquals(byteArrayOf(2) + ByteArray(64), wire.copyOf(65))
+        assertTrue(verifies(wire.copyOfRange(65, 129), message, publicKey))
+        assertContentEquals(message, wire.copyOfRange(129, wire.size))
         assertFalse(signed.isComplete)
     }
 
@@ -103,5 +130,22 @@ class MemorySignerTest {
         assertEquals("Invalid private key format", error.message)
         assertFalse(error.detail in error.toString())
         assertEquals("MemorySigner(address=$ADDRESS)", MemorySigner.fromBytes(seed).toString())
+    }
+
+    @Test
+    fun `signMessage verifies against the derived pubkey`() {
+        val message = "solana-keychain".toByteArray()
+        assertTrue(verifies(MemorySigner.fromBytes(seed).signMessage(message), message, publicKey))
+    }
+
+    @Test
+    fun `legacy golden parity vectors`() {
+        val signer = MemorySigner.fromBytes(CANONICAL_KEYPAIR_BYTES)
+        val message = Base64.getDecoder().decode(GOLDEN_MESSAGE_B64)
+        val signed = signer.signTransaction(byteArrayOf(1) + ByteArray(64) + message)
+        assertEquals(GOLDEN_PUBKEY, signer.address)
+        assertTrue(signed.isComplete)
+        assertEquals(GOLDEN_SIGNED_TX_B64, signed.encodedTransaction)
+        assertTrue(verifies(signed.signature, message, CANONICAL_KEYPAIR_BYTES.copyOfRange(32, 64)))
     }
 }
