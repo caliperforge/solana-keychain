@@ -57,7 +57,7 @@ private fun verifies(signature: ByteArray, message: ByteArray, pubkey: ByteArray
 
 class MemorySignerTest {
     @Test
-    fun `D1 reproduces the Go golden signed transaction`() {
+    fun `reproduces the Go golden signed transaction`() {
         val signer = MemorySigner.fromBytes(seed)
         val signed = signer.signTransaction(unsigned)
         assertEquals(ADDRESS, signer.address)
@@ -66,7 +66,7 @@ class MemorySignerTest {
     }
 
     @Test
-    fun `D2 every key source gives the same address`() {
+    fun `every key source gives the same address`() {
         val signers = listOf(
             MemorySigner.fromBytes(seed),
             MemorySigner.fromBytes(keypair),
@@ -78,7 +78,7 @@ class MemorySignerTest {
     }
 
     @Test
-    fun `D3 invalid keys are refused`() {
+    fun `invalid keys are refused`() {
         val mismatched = keypair.copyOf().also { it[63] = (it[63] + 1).toByte() }
         val invalid = listOf<() -> Unit>(
             { MemorySigner.fromBytes(mismatched) },
@@ -93,7 +93,7 @@ class MemorySignerTest {
     }
 
     @Test
-    fun `D4 keypair file failures are refused`() {
+    fun `keypair file failures are refused`() {
         val missing = File.createTempFile("missing", ".json").apply { delete() }
         assertRefused("SIGNER_IO_ERROR") { MemorySigner.fromKeypairFile(missing.path) }
         assertRefused("SIGNER_INVALID_PRIVATE_KEY") {
@@ -102,7 +102,7 @@ class MemorySignerTest {
     }
 
     @Test
-    fun `D5 transactions the signer cannot sign are refused`() {
+    fun `transactions the signer cannot sign are refused`() {
         val signer = MemorySigner.fromBytes(seed)
         val tooFewKeys = unsigned.copyOf().also { it[65] = 4 }
         val v1 = byteArrayOf(0, 0x81.toByte()) + unsigned.copyOfRange(66, unsigned.size)
@@ -113,7 +113,7 @@ class MemorySignerTest {
     }
 
     @Test
-    fun `D6 a second signer leaves slot 0 zero and the transaction partial`() {
+    fun `a second signer leaves slot 0 zero and the transaction partial`() {
         val signer = MemorySigner.fromBytes(seed)
         val message = byteArrayOf(0x80.toByte(), 2, 0, 0, 2) + ByteArray(32) { 7 } + publicKey + ByteArray(32) + byteArrayOf(0, 0)
         val signed = signer.signTransaction(byteArrayOf(0) + message)
@@ -125,7 +125,7 @@ class MemorySignerTest {
     }
 
     @Test
-    fun `D7 errors and the signer render no detail or key material`() {
+    fun `errors and the signer render no detail or key material`() {
         val error = assertFailsWith<SignerError> { MemorySigner.fromBytes(ByteArray(31)) }
         assertEquals("Invalid private key format", error.message)
         assertFalse(error.detail in error.toString())
