@@ -396,9 +396,15 @@ go-test-integration:
 # ========================== Kotlin =========================
 # ===========================================================
 
+# Gradle 9.7.1, the version kotlin-ci.yml pins.
+
 [working-directory: 'kotlin']
 kotlin-fmt:
-    gradle check
+    gradle spotlessApply
+
+[working-directory: 'kotlin']
+kotlin-check:
+    gradle spotlessCheck test
 
 [working-directory: 'kotlin']
 kotlin-build:

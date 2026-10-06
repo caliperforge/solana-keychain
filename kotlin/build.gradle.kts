@@ -1,6 +1,7 @@
 plugins {
     kotlin("jvm") version "2.2.20"
     `java-library-distribution`
+    id("com.diffplug.spotless") version "8.0.0"
 }
 
 repositories {
@@ -14,6 +15,11 @@ dependencies {
 
 kotlin {
     jvmToolchain(17)
+}
+
+spotless {
+    kotlin { ktlint() }
+    kotlinGradle { ktlint() }
 }
 
 tasks.test {

@@ -2,6 +2,9 @@ package com.solana.keychain.memory
 
 import com.solana.keychain.Base58
 import com.solana.keychain.SignerError
+import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
+import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters
+import org.bouncycastle.crypto.signers.Ed25519Signer
 import java.io.File
 import java.util.Base64
 import kotlin.test.Test
@@ -10,20 +13,83 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
-import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
-import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters
-import org.bouncycastle.crypto.signers.Ed25519Signer
 
 private const val ADDRESS = "9C6hybhQ6Aycep9jaUnP6uL9ZYvDjUp1aSkFWPUFJtpj"
-private const val MESSAGE_B64 = "AQABA3m1Vi6P5lT5QHixEuipi6eQH4U65pW+1+DjkQutBJZkIVL40Zt5HSRFMkLhXy6rbLfP+ntqXtMAl5YOBpiB2xIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJAQICAAEMAgAAAEBCDwAAAAAA"
-private const val SIGNED_TX_B64 = "AQUSPyADYLJarC6XLNhwmO1ZNP7/MECEKnIrOtFcIShPQX3yXWFNn9ftJEhqvrA0W01eyrBk8Pojgs+jRn23Nw4BAAEDebVWLo/mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQhUvjRm3kdJEUyQuFfLqtst8/6e2pe0wCXlg4GmIHbEgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkBAgIAAQwCAAAAQEIPAAAAAAA="
+private const val MESSAGE_B64 =
+    "AQABA3m1Vi6P5lT5QHixEuipi6eQH4U65pW+1+DjkQutBJZkIVL40Zt5HSRFMkLhXy6rbLfP+" +
+        "ntqXtMAl5YOBpiB2xIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJAQICAAEMAgAAAEBCDwAAAAAA"
+private const val SIGNED_TX_B64 =
+    "AQUSPyADYLJarC6XLNhwmO1ZNP7/MECEKnIrOtFcIShPQX3yXWFNn9ftJEhqvrA0W01eyrBk8Pojgs+jRn23Nw4B" +
+        "AAEDebVWLo/mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQhUvjRm3kdJEUyQuFfLqtst8/6e2pe0w" +
+        "CXlg4GmIHbEgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkBAgIAAQwCAAAAQEIPAAAAAAA="
 
-private val CANONICAL_KEYPAIR_BYTES = listOf(
-    41, 99, 180, 88, 51, 57, 48, 80, 61, 63, 219, 75, 176, 49, 116, 254,
-    227, 176, 196, 204, 122, 47, 166, 133, 155, 252, 217, 0, 253, 17, 49, 143,
-    47, 94, 121, 167, 195, 136, 72, 22, 157, 48, 77, 88, 63, 96, 57, 122,
-    181, 243, 236, 188, 241, 134, 174, 224, 100, 246, 17, 170, 104, 17, 151, 48,
-).map(Int::toByte).toByteArray()
+private val CANONICAL_KEYPAIR_BYTES =
+    listOf(
+        41,
+        99,
+        180,
+        88,
+        51,
+        57,
+        48,
+        80,
+        61,
+        63,
+        219,
+        75,
+        176,
+        49,
+        116,
+        254,
+        227,
+        176,
+        196,
+        204,
+        122,
+        47,
+        166,
+        133,
+        155,
+        252,
+        217,
+        0,
+        253,
+        17,
+        49,
+        143,
+        47,
+        94,
+        121,
+        167,
+        195,
+        136,
+        72,
+        22,
+        157,
+        48,
+        77,
+        88,
+        63,
+        96,
+        57,
+        122,
+        181,
+        243,
+        236,
+        188,
+        241,
+        134,
+        174,
+        224,
+        100,
+        246,
+        17,
+        170,
+        104,
+        17,
+        151,
+        48,
+    ).map(Int::toByte).toByteArray()
 private const val GOLDEN_PUBKEY = "4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR"
 private const val GOLDEN_MESSAGE_B64 =
     "AQABAy9eeafDiEgWnTBNWD9gOXq18+y88Yau4GT2EapoEZcwAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC" +
@@ -41,15 +107,22 @@ private val keypair = seed + publicKey
 private val u8Array = keypair.joinToString(",", "[", "]") { (it.toInt() and 0xff).toString() }
 private val unsigned = byteArrayOf(1) + ByteArray(64) + Base64.getDecoder().decode(MESSAGE_B64)
 
-private fun keypairFile(contents: String) = File.createTempFile("keypair", ".json").apply {
-    deleteOnExit()
-    writeText(contents)
-}
+private fun keypairFile(contents: String) =
+    File.createTempFile("keypair", ".json").apply {
+        deleteOnExit()
+        writeText(contents)
+    }
 
-private fun assertRefused(code: String, block: () -> Unit) =
-    assertEquals(code, assertFailsWith<SignerError> { block() }.code.value)
+private fun assertRefused(
+    code: String,
+    block: () -> Unit,
+) = assertEquals(code, assertFailsWith<SignerError> { block() }.code.value)
 
-private fun verifies(signature: ByteArray, message: ByteArray, pubkey: ByteArray) = Ed25519Signer().run {
+private fun verifies(
+    signature: ByteArray,
+    message: ByteArray,
+    pubkey: ByteArray,
+) = Ed25519Signer().run {
     init(false, Ed25519PublicKeyParameters(pubkey, 0))
     update(message, 0, message.size)
     verifySignature(signature)
@@ -67,28 +140,30 @@ class MemorySignerTest {
 
     @Test
     fun `every key source gives the same address`() {
-        val signers = listOf(
-            MemorySigner.fromBytes(seed),
-            MemorySigner.fromBytes(keypair),
-            MemorySigner.fromPrivateKeyString(Base58.encode(keypair)),
-            MemorySigner.fromPrivateKeyString(" $u8Array\n"),
-            MemorySigner.fromKeypairFile(keypairFile(u8Array).path),
-        )
+        val signers =
+            listOf(
+                MemorySigner.fromBytes(seed),
+                MemorySigner.fromBytes(keypair),
+                MemorySigner.fromPrivateKeyString(Base58.encode(keypair)),
+                MemorySigner.fromPrivateKeyString(" $u8Array\n"),
+                MemorySigner.fromKeypairFile(keypairFile(u8Array).path),
+            )
         signers.forEach { assertEquals(ADDRESS, it.address) }
     }
 
     @Test
     fun `invalid keys are refused`() {
         val mismatched = keypair.copyOf().also { it[63] = (it[63] + 1).toByte() }
-        val invalid = listOf<() -> Unit>(
-            { MemorySigner.fromBytes(mismatched) },
-            { MemorySigner.fromBytes(ByteArray(48)) },
-            { MemorySigner.fromPrivateKeyString(Base58.encode(seed)) },
-            { MemorySigner.fromPrivateKeyString("0OIl") },
-            { MemorySigner.fromPrivateKeyString("[]") },
-            { MemorySigner.fromPrivateKeyString(u8Array.replaceFirst("[1,", "[256,")) },
-            { MemorySigner.fromPrivateKeyString(u8Array.replaceFirst("[1,", "[1.0,")) },
-        )
+        val invalid =
+            listOf<() -> Unit>(
+                { MemorySigner.fromBytes(mismatched) },
+                { MemorySigner.fromBytes(ByteArray(48)) },
+                { MemorySigner.fromPrivateKeyString(Base58.encode(seed)) },
+                { MemorySigner.fromPrivateKeyString("0OIl") },
+                { MemorySigner.fromPrivateKeyString("[]") },
+                { MemorySigner.fromPrivateKeyString(u8Array.replaceFirst("[1,", "[256,")) },
+                { MemorySigner.fromPrivateKeyString(u8Array.replaceFirst("[1,", "[1.0,")) },
+            )
         invalid.forEach { assertRefused("SIGNER_INVALID_PRIVATE_KEY", it) }
     }
 
@@ -110,6 +185,15 @@ class MemorySignerTest {
         assertRefused("SIGNER_SIGNING_FAILED") { signer.signTransaction(tooFewKeys) }
         assertRefused("SIGNER_SERIALIZATION_ERROR") { signer.signTransaction(v1) }
         assertRefused("SIGNER_SERIALIZATION_ERROR") { signer.signTransaction(unsigned.copyOf(100)) }
+    }
+
+    @Test
+    fun `truncated or overlong messages are refused`() {
+        val signer = MemorySigner.fromBytes(seed)
+        val v0 = byteArrayOf(0, 0x80.toByte(), 1, 0, 0, 1) + publicKey + ByteArray(32) + byteArrayOf(0, 0)
+        assertRefused("SIGNER_SERIALIZATION_ERROR") { signer.signTransaction(unsigned.copyOf(unsigned.size - 1)) }
+        assertRefused("SIGNER_SERIALIZATION_ERROR") { signer.signTransaction(v0.copyOf(v0.size - 1)) }
+        assertRefused("SIGNER_SERIALIZATION_ERROR") { signer.signTransaction(unsigned + byteArrayOf(0)) }
     }
 
     @Test

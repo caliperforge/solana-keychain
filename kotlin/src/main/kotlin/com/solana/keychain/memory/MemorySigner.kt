@@ -6,27 +6,29 @@ import com.solana.keychain.SignerError
 import com.solana.keychain.SignerErrorCode
 import com.solana.keychain.TransactionSigner
 import com.solana.keychain.signWireTransaction
-import java.io.File
-import java.io.IOException
 import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
 import org.bouncycastle.crypto.signers.Ed25519Signer
+import java.io.File
+import java.io.IOException
 
 private const val SEED_LENGTH = 32
 private const val KEYPAIR_LENGTH = 64
 
-class MemorySigner private constructor(seed: ByteArray) : TransactionSigner {
+class MemorySigner private constructor(
+    seed: ByteArray,
+) : TransactionSigner {
     private val privateKey = Ed25519PrivateKeyParameters(seed, 0)
     private val publicKey = privateKey.generatePublicKey().encoded
     override val address: String = Base58.encode(publicKey)
 
-    override fun signMessage(message: ByteArray): ByteArray = Ed25519Signer().run {
-        init(true, privateKey)
-        update(message, 0, message.size)
-        generateSignature()
-    }
+    override fun signMessage(message: ByteArray): ByteArray =
+        Ed25519Signer().run {
+            init(true, privateKey)
+            update(message, 0, message.size)
+            generateSignature()
+        }
 
-    override fun signTransaction(transaction: ByteArray): SignedTransaction =
-        signWireTransaction(transaction, publicKey, ::signMessage)
+    override fun signTransaction(transaction: ByteArray): SignedTransaction = signWireTransaction(transaction, publicKey, ::signMessage)
 
     override fun isAvailable(): Boolean = true
 
@@ -51,11 +53,12 @@ class MemorySigner private constructor(seed: ByteArray) : TransactionSigner {
         }
 
         fun fromKeypairFile(path: String): MemorySigner {
-            val contents = try {
-                File(path).readText()
-            } catch (e: IOException) {
-                throw SignerError(SignerErrorCode.IO_ERROR, "failed to read keypair file")
-            }
+            val contents =
+                try {
+                    File(path).readText()
+                } catch (e: IOException) {
+                    throw SignerError(SignerErrorCode.IO_ERROR, "failed to read keypair file")
+                }
             return fromKeypairBytes(parseU8Array(contents.trim()))
         }
 
@@ -64,9 +67,16 @@ class MemorySigner private constructor(seed: ByteArray) : TransactionSigner {
 
         private fun parseU8Array(text: String): ByteArray? {
             if (!text.startsWith("[") || !text.endsWith("]")) return null
-            return text.substring(1, text.length - 1).split(",")
-                .map { it.trim().toIntOrNull()?.takeIf { value -> value in 0..255 }?.toByte() ?: return null }
-                .toByteArray()
+            return text
+                .substring(1, text.length - 1)
+                .split(",")
+                .map {
+                    it
+                        .trim()
+                        .toIntOrNull()
+                        ?.takeIf { value -> value in 0..255 }
+                        ?.toByte() ?: return null
+                }.toByteArray()
         }
     }
 }

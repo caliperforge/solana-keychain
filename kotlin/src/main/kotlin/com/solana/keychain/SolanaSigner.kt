@@ -6,6 +6,7 @@ import java.util.Base64
 
 private const val SIGNATURE_LENGTH = 64
 private const val PUBKEY_LENGTH = 32
+private const val BLOCKHASH_LENGTH = 32
 private const val VERSION_PREFIX = 0x80
 
 interface SolanaSigner {
@@ -20,16 +21,26 @@ interface TransactionSigner : SolanaSigner {
     fun signTransaction(transaction: ByteArray): SignedTransaction
 }
 
-class SignedTransaction(val encodedTransaction: String, val signature: ByteArray, val isComplete: Boolean)
+class SignedTransaction(
+    val encodedTransaction: String,
+    val signature: ByteArray,
+    val isComplete: Boolean,
+)
 
-enum class SignerErrorCode(val value: String, val message: String) {
+enum class SignerErrorCode(
+    val value: String,
+    val message: String,
+) {
     INVALID_PRIVATE_KEY("SIGNER_INVALID_PRIVATE_KEY", "Invalid private key format"),
     IO_ERROR("SIGNER_IO_ERROR", "IO error"),
     SERIALIZATION_ERROR("SIGNER_SERIALIZATION_ERROR", "Serialization error"),
     SIGNING_FAILED("SIGNER_SIGNING_FAILED", "Signing failed"),
 }
 
-class SignerError(val code: SignerErrorCode, val detail: String) : Exception(code.message)
+class SignerError(
+    val code: SignerErrorCode,
+    val detail: String,
+) : Exception(code.message)
 
 object Base58 {
     private const val ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -58,18 +69,25 @@ object Base58 {
     }
 }
 
-fun signWireTransaction(transaction: ByteArray, pubkey: ByteArray, sign: (ByteArray) -> ByteArray): SignedTransaction {
+fun signWireTransaction(
+    transaction: ByteArray,
+    pubkey: ByteArray,
+    sign: (ByteArray) -> ByteArray,
+): SignedTransaction {
     val reader = WireReader(transaction)
     val signatures = MutableList(reader.compactU16()) { reader.take(SIGNATURE_LENGTH) }
     val messageStart = reader.position
     val prefix = reader.byte()
-    val numRequired = when {
-        (prefix and VERSION_PREFIX) == 0 -> prefix
-        prefix == VERSION_PREFIX -> reader.byte()
-        else -> throw SignerError(SignerErrorCode.SERIALIZATION_ERROR, "unsupported transaction version")
-    }
+    val versioned = prefix == VERSION_PREFIX
+    val numRequired =
+        when {
+            (prefix and VERSION_PREFIX) == 0 -> prefix
+            versioned -> reader.byte()
+            else -> throw SignerError(SignerErrorCode.SERIALIZATION_ERROR, "unsupported transaction version")
+        }
     reader.take(2)
     val accountKeys = List(reader.compactU16()) { reader.take(PUBKEY_LENGTH) }
+    reader.skipMessageBody(versioned)
     val position = accountKeys.take(numRequired).indexOfFirst { it.contentEquals(pubkey) }
     if (accountKeys.size < numRequired || position < 0) {
         throw SignerError(SignerErrorCode.SIGNING_FAILED, "pubkey is not a required signer of the transaction")
@@ -83,7 +101,9 @@ fun signWireTransaction(transaction: ByteArray, pubkey: ByteArray, sign: (ByteAr
     return SignedTransaction(Base64.getEncoder().encodeToString(wire), signature, isComplete)
 }
 
-private class WireReader(private val bytes: ByteArray) {
+private class WireReader(
+    private val bytes: ByteArray,
+) {
     var position = 0
         private set
 
@@ -95,6 +115,25 @@ private class WireReader(private val bytes: ByteArray) {
     }
 
     fun byte(): Int = take(1)[0].toInt() and 0xff
+
+    fun skipMessageBody(versioned: Boolean) {
+        take(BLOCKHASH_LENGTH)
+        repeat(compactU16()) {
+            byte()
+            take(compactU16())
+            take(compactU16())
+        }
+        if (versioned) {
+            repeat(compactU16()) {
+                take(PUBKEY_LENGTH)
+                take(compactU16())
+                take(compactU16())
+            }
+        }
+        if (position != bytes.size) {
+            throw SignerError(SignerErrorCode.SERIALIZATION_ERROR, "transaction has trailing bytes")
+        }
+    }
 
     fun compactU16(): Int {
         var value = 0
