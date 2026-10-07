@@ -106,6 +106,10 @@ private val publicKey = Ed25519PrivateKeyParameters(seed, 0).generatePublicKey()
 private val keypair = seed + publicKey
 private val u8Array = keypair.joinToString(",", "[", "]") { (it.toInt() and 0xff).toString() }
 private val unsigned = byteArrayOf(1) + ByteArray(64) + Base64.getDecoder().decode(MESSAGE_B64)
+private val lookupTableMessage =
+    byteArrayOf(0x80.toByte(), 1, 0, 0, 1) + publicKey + ByteArray(32) + byteArrayOf(0, 1) + ByteArray(32) { 5 } +
+        byteArrayOf(1, 0, 1, 1)
+private val lookupTableTx = byteArrayOf(0) + lookupTableMessage
 
 private fun keypairFile(contents: String) =
     File.createTempFile("keypair", ".json").apply {
@@ -194,6 +198,20 @@ class MemorySignerTest {
         assertRefused("SIGNER_SERIALIZATION_ERROR") { signer.signTransaction(unsigned.copyOf(unsigned.size - 1)) }
         assertRefused("SIGNER_SERIALIZATION_ERROR") { signer.signTransaction(v0.copyOf(v0.size - 1)) }
         assertRefused("SIGNER_SERIALIZATION_ERROR") { signer.signTransaction(unsigned + byteArrayOf(0)) }
+    }
+
+    @Test
+    fun `v0 with a lookup table signs`() {
+        val signed = MemorySigner.fromBytes(seed).signTransaction(lookupTableTx)
+        assertTrue(verifies(signed.signature, lookupTableMessage, publicKey))
+        assertTrue(signed.isComplete)
+    }
+
+    @Test
+    fun `truncated lookup table lists are refused`() {
+        val signer = MemorySigner.fromBytes(seed)
+        assertRefused("SIGNER_SERIALIZATION_ERROR") { signer.signTransaction(lookupTableTx.copyOf(lookupTableTx.size - 3)) }
+        assertRefused("SIGNER_SERIALIZATION_ERROR") { signer.signTransaction(lookupTableTx.copyOf(lookupTableTx.size - 1)) }
     }
 
     @Test
