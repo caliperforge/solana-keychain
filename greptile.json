@@ -1,0 +1,21 @@
+{
+  "autoReview": [],
+  "strictness": 1,
+  "customContext": {
+    "rules": [
+      {
+        "rule": "solana-keychain#3 `caliperforge/solana-keychain@9e2feff:kotlin/src/main/kotlin/com/solana/keychain/SolanaSigner.kt:96`: <a href=\"#\"><img alt=\"P2\" src=\"https://greptile-static-assets.s3.amazonaws.com/badges/p2.svg?v=9\" align=\"top\"></a> **Truncated transactions appear complete** (https://github.com/caliperforge/solana-keychain/pull/3#discussion_r4201372238).",
+        "scope": [
+          "**"
+        ]
+      },
+      {
+        "rule": "solana-keychain#3 `caliperforge/solana-keychain@af41d24:kotlin/src/test/kotlin/com/solana/keychain/memory/MemorySignerTest.kt:193`: <a href=\"#\"><img alt=\"P2\" src=\"https://greptile-static-assets.s3.amazonaws.com/badges/p2.svg?v=9\" align=\"top\"></a> **Lookup tables go untested** (https://github.com/caliperforge/solana-keychain/pull/3#discussion_r4201469985).",
+        "scope": [
+          "**"
+        ]
+      }
+    ],
+    "files": []
+  }
+}
