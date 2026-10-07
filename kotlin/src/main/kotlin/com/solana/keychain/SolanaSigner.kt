@@ -92,6 +92,9 @@ fun signWireTransaction(
     if (accountKeys.size < numRequired || position < 0) {
         throw SignerError(SignerErrorCode.SIGNING_FAILED, "pubkey is not a required signer of the transaction")
     }
+    if (signatures.size > numRequired) {
+        throw SignerError(SignerErrorCode.SERIALIZATION_ERROR, "transaction has more signatures than the message requires")
+    }
     val message = transaction.copyOfRange(messageStart, transaction.size)
     val signature = sign(message)
     while (signatures.size < numRequired) signatures += ByteArray(SIGNATURE_LENGTH)
@@ -135,11 +138,18 @@ private class WireReader(
         }
     }
 
+    // Canonical shortvec only: no trailing zero byte, and the third byte carries at most 2 bits.
     fun compactU16(): Int {
         var value = 0
-        for (shift in 0..14 step 7) {
+        for (index in 0..2) {
             val byte = byte()
-            value = value or ((byte and 0x7f) shl shift)
+            if (index > 0 && byte == 0) {
+                throw SignerError(SignerErrorCode.SERIALIZATION_ERROR, "compact-u16 is not canonical")
+            }
+            if (index == 2 && byte > 0x03) {
+                throw SignerError(SignerErrorCode.SERIALIZATION_ERROR, "compact-u16 overflows")
+            }
+            value = value or ((byte and 0x7f) shl (7 * index))
             if ((byte and 0x80) == 0) return value
         }
         throw SignerError(SignerErrorCode.SERIALIZATION_ERROR, "compact-u16 overflows")

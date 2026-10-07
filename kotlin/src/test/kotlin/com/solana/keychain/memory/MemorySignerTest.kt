@@ -201,6 +201,15 @@ class MemorySignerTest {
     }
 
     @Test
+    fun `non-canonical lengths and extra signature slots are refused`() {
+        val signer = MemorySigner.fromBytes(seed)
+        val message = unsigned.copyOfRange(65, unsigned.size)
+        assertRefused("SIGNER_SERIALIZATION_ERROR") { signer.signTransaction(byteArrayOf(0x81.toByte(), 0) + ByteArray(64) + message) }
+        assertRefused("SIGNER_SERIALIZATION_ERROR") { signer.signTransaction(byteArrayOf(0x80.toByte(), 0x80.toByte(), 0x04) + message) }
+        assertRefused("SIGNER_SERIALIZATION_ERROR") { signer.signTransaction(byteArrayOf(2) + ByteArray(128) + message) }
+    }
+
+    @Test
     fun `v0 with a lookup table signs`() {
         val signed = MemorySigner.fromBytes(seed).signTransaction(lookupTableTx)
         assertTrue(verifies(signed.signature, lookupTableMessage, publicKey))
@@ -224,6 +233,22 @@ class MemorySignerTest {
         assertTrue(verifies(wire.copyOfRange(65, 129), message, publicKey))
         assertContentEquals(message, wire.copyOfRange(129, wire.size))
         assertFalse(signed.isComplete)
+    }
+
+    @Test
+    fun `a second signer keeps the first signature`() {
+        val otherSeed = ByteArray(32) { (it + 33).toByte() }
+        val otherKey = Ed25519PrivateKeyParameters(otherSeed, 0).generatePublicKey().encoded
+        val message = byteArrayOf(0x80.toByte(), 2, 0, 0, 2) + otherKey + publicKey + ByteArray(32) + byteArrayOf(0, 0)
+        val first = MemorySigner.fromBytes(seed).signTransaction(byteArrayOf(0) + message)
+        assertFalse(first.isComplete)
+        val second = MemorySigner.fromBytes(otherSeed).signTransaction(Base64.getDecoder().decode(first.encodedTransaction))
+        val wire = Base64.getDecoder().decode(second.encodedTransaction)
+        assertEquals(2, wire[0].toInt())
+        assertContentEquals(first.signature, wire.copyOfRange(65, 129))
+        assertTrue(verifies(wire.copyOfRange(1, 65), message, otherKey))
+        assertTrue(verifies(wire.copyOfRange(65, 129), message, publicKey))
+        assertTrue(second.isComplete)
     }
 
     @Test
