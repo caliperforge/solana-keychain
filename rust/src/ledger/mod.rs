@@ -52,17 +52,15 @@
 
 mod dashboard;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 
 use solana_derivation_path::DerivationPath;
-use solana_remote_wallet::ledger::LedgerWallet;
-use solana_remote_wallet::remote_wallet::{
-    initialize_wallet_manager, RemoteWallet, RemoteWalletError, RemoteWalletType,
-};
+use solana_remote_wallet::ledger::{is_valid_ledger, LedgerWallet};
+use solana_remote_wallet::remote_wallet::{is_valid_hid_device, RemoteWallet, RemoteWalletError};
 
 use crate::error::SignerError;
 use crate::sdk_adapter::{Pubkey, Signature, VersionedTransaction};
@@ -195,9 +193,9 @@ enum DeviceCommand {
     /// Exists so callers never have to touch `hidapi` themselves; see
     /// [`device_channel`] for why that matters.
     IsAttached { reply: Sender<bool> },
-    /// The last signer bound to `host_device_path` was dropped; close its
-    /// session. Carries no claim: a drop cannot fail fast, and closing a handle
-    /// never waits on the user.
+    /// A signer was opened against `host_device_path`.
+    Bind { host_device_path: Option<String> },
+    /// A signer opened against `host_device_path` was dropped.
     Release { host_device_path: Option<String> },
 }
 
@@ -257,56 +255,6 @@ fn device_channel() -> &'static Sender<DeviceCommand> {
     })
 }
 
-/// Live [`DeviceBinding`]s per host path: one per signer and one per command in
-/// flight.
-static BOUND: std::sync::Mutex<BTreeMap<Option<String>, usize>> =
-    std::sync::Mutex::new(BTreeMap::new());
-
-/// A signer's hold on its `host_device_path`. Dropping the last one for a path
-/// sends [`DeviceCommand::Release`], so the device thread keeps no session that
-/// no live signer is bound to.
-struct DeviceBinding {
-    host_device_path: Option<String>,
-}
-
-impl DeviceBinding {
-    fn bind(host_device_path: Option<String>) -> Self {
-        *BOUND
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(host_device_path.clone())
-            .or_default() += 1;
-        Self { host_device_path }
-    }
-}
-
-/// A command in flight holds a clone, so a signer dropped before the command is
-/// sent cannot release the session ahead of it.
-impl Clone for DeviceBinding {
-    fn clone(&self) -> Self {
-        Self::bind(self.host_device_path.clone())
-    }
-}
-
-impl Drop for DeviceBinding {
-    fn drop(&mut self) {
-        let mut bound = BOUND.lock().unwrap_or_else(|e| e.into_inner());
-        let count = bound
-            .get_mut(&self.host_device_path)
-            .expect("counted by bind");
-        *count -= 1;
-        if *count == 0 {
-            bound.remove(&self.host_device_path);
-            // Every command is sent while a binding is live, and this is sent
-            // under the lock, so it reaches the thread after every command for
-            // this path and ahead of the connect of any signer that rebinds it.
-            let _ = command_channel().send(DeviceCommand::Release {
-                host_device_path: self.host_device_path.take(),
-            });
-        }
-    }
-}
-
 /// A [`SolanaSigner`] backed by a Ledger hardware wallet.
 ///
 /// Cheap to create and drop: it holds no thread and no device handle, only the
@@ -318,7 +266,7 @@ pub struct LedgerSigner {
     /// The device this signer was opened against, carried on every later
     /// command so a lost session re-establishes against the same one rather
     /// than whichever Ledger happens to be attached.
-    device: DeviceBinding,
+    host_device_path: Option<String>,
     /// Timeout for the device commands that wait on a button press.
     signing_timeout: Duration,
 }
@@ -328,6 +276,16 @@ impl std::fmt::Debug for LedgerSigner {
         f.debug_struct("LedgerSigner")
             .field("pubkey", &self.pubkey)
             .finish_non_exhaustive()
+    }
+}
+
+/// Tells the device thread this signer is gone, so it can close the session
+/// once no signer on the same host path is left.
+impl Drop for LedgerSigner {
+    fn drop(&mut self) {
+        let _ = command_channel().send(DeviceCommand::Release {
+            host_device_path: self.host_device_path.take(),
+        });
     }
 }
 
@@ -405,7 +363,7 @@ impl LedgerSigner {
             OPS_TIMEOUT
         };
 
-        let device = DeviceBinding::bind(host_device_path.clone());
+        let requested_device = host_device_path.clone();
         // A connect can reach the user too, so it takes the same claim rather
         // than racing a signature already at the confirm screen.
         let claim = DeviceClaim::acquire()?;
@@ -419,18 +377,21 @@ impl LedgerSigner {
                 reply,
             }
         })?;
+        let _ = command_channel().send(DeviceCommand::Bind {
+            host_device_path: requested_device.clone(),
+        });
 
         Ok(Self {
             pubkey: Pubkey::from(pubkey_bytes),
             path_str,
-            device,
+            host_device_path: requested_device,
             signing_timeout,
         })
     }
 
     /// The device this signer was opened against, if one was named.
     pub fn host_device_path(&self) -> Option<&str> {
-        self.device.host_device_path.as_deref()
+        self.host_device_path.as_deref()
     }
 
     /// The timeout this signer applies to commands that wait on a button press.
@@ -499,7 +460,7 @@ impl SolanaSigner for LedgerSigner {
         // into the device closure.
         let verify_against = serialized.clone();
         let path_str = self.path_str.clone();
-        let device = self.device.clone();
+        let host_device_path = self.host_device_path.clone();
         let timeout = self.signing_timeout;
         // One process serializes to one on-device confirmation at a time. Claim
         // the device before enqueueing, so a racing caller fails fast instead of
@@ -512,7 +473,7 @@ impl SolanaSigner for LedgerSigner {
                     claim,
                     path_str,
                     message: serialized,
-                    host_device_path: device.host_device_path.clone(),
+                    host_device_path,
                     reply,
                 }
             })
@@ -534,7 +495,7 @@ impl SolanaSigner for LedgerSigner {
     /// `false` rather than blocking when the device thread is wedged.
     async fn is_available(&self) -> bool {
         let path_str = self.path_str.clone();
-        let device = self.device.clone();
+        let host_device_path = self.host_device_path.clone();
         tokio::task::spawn_blocking(move || {
             // Probe, not an operation: if someone else holds the device, report
             // "not available" rather than queueing behind their prompt.
@@ -546,7 +507,7 @@ impl SolanaSigner for LedgerSigner {
                 .send(DeviceCommand::IsAvailable {
                     claim,
                     path_str,
-                    host_device_path: device.host_device_path.clone(),
+                    host_device_path,
                     reply: reply_tx,
                 })
                 .is_err()
@@ -588,7 +549,7 @@ impl TransactionSigner for LedgerSigner {
         // into the device closure.
         let verify_against = message.clone();
         let path_str = self.path_str.clone();
-        let device = self.device.clone();
+        let host_device_path = self.host_device_path.clone();
         let timeout = self.signing_timeout;
         // One process serializes to one on-device confirmation at a time. Claim
         // the device before enqueueing, so a racing caller fails fast instead of
@@ -601,7 +562,7 @@ impl TransactionSigner for LedgerSigner {
                     claim,
                     path_str,
                     message,
-                    host_device_path: device.host_device_path.clone(),
+                    host_device_path,
                     reply,
                 }
             })
@@ -850,10 +811,12 @@ fn request_on<T: Send + 'static>(
 
 /// The device-actor thread body. Owns the single-threaded `solana-remote-wallet`
 /// handles and serves [`DeviceCommand`]s until the command channel closes.
-/// Establish a device session: enumerate, select, and read the pubkey.
+/// Establish a device session: list, select, open only the selected device,
+/// and read the pubkey.
 ///
 /// Runs only on the device thread. Returns the wallet handle so the caller can
-/// cache it for subsequent commands.
+/// cache it for subsequent commands. Listing does not open anything, so a
+/// device another cached session holds is never opened a second time.
 fn establish_session(
     path: &DerivationPath,
     confirm_pubkey_on_device: bool,
@@ -863,7 +826,7 @@ fn establish_session(
     // not a signing failure — map it to NotAvailable directly rather than
     // letting map_rw_err's catch-all bucket it as SigningFailed (which would
     // also make the no-device unit test panic on CI runners lacking libhidapi).
-    let manager = initialize_wallet_manager().map_err(|_e| {
+    let api = hidapi::HidApi::new().map_err(|_e| {
         #[cfg(feature = "unsafe-debug")]
         log::error!("Ledger HID subsystem unavailable: {_e}");
         SignerError::NotAvailable(
@@ -872,50 +835,38 @@ fn establish_session(
                 .to_string(),
         )
     })?;
-    let count = manager.update_devices().map_err(map_rw_err)?;
-    if count == 0 {
-        return Err(no_ledger_enumerated_error());
-    }
 
-    // `list_devices` filters to valid Ledger wallets by VID/PID + HID usage,
-    // but it also enumerates Trezor (and optionally Keystone) devices. The
-    // `wallet_type` variant is what identifies a Ledger — not the model,
-    // which is the device *name* ("nano-gen5", "nano-x", "stax", …) and never
-    // "ledger". Taking the `Rc<LedgerWallet>` straight out of the variant
-    // also removes the second `get_wallet`/`get_ledger` lookup by path.
-    let ledgers: Vec<Rc<LedgerWallet>> = manager
-        .list_devices()
-        .into_iter()
-        .filter_map(|d| match d.wallet_type {
-            RemoteWalletType::Ledger(wallet) => Some(wallet),
-            _ => None,
+    // The filter `solana-remote-wallet`'s own enumeration applies.
+    let ledgers: Vec<&hidapi::DeviceInfo> = api
+        .device_list()
+        .filter(|d| {
+            is_valid_hid_device(d.usage_page(), d.interface_number())
+                && is_valid_ledger(d.vendor_id(), d.product_id())
         })
         .collect();
+    if ledgers.is_empty() {
+        return Err(no_ledger_enumerated_error());
+    }
 
     // Deterministic device selection: honor an explicit host path; otherwise
     // require exactly one device rather than silently picking the first (the
     // enumeration order is OS-dependent and unstable across re-plugs).
-    let ledger = match host_device_path {
+    let info = match host_device_path {
         Some(want) => ledgers
             .into_iter()
-            .find(|w| hid_path(w).as_deref() == Some(want))
+            .find(|d| d.path().to_str() == Ok(want))
             .ok_or_else(|| {
                 SignerError::NotAvailable(format!("no Ledger device at host path `{want}`"))
             })?,
-        None => match ledgers.len() {
-            0 => return Err(no_ledger_enumerated_error()),
-            1 => ledgers.into_iter().next().expect("len == 1"),
+        None => match ledgers.as_slice() {
+            [sole] => *sole,
             _ => {
                 #[cfg(feature = "unsafe-debug")]
                 log::error!(
                     "multiple Ledger devices attached: {}",
                     ledgers
                         .iter()
-                        .map(|w| format!(
-                            "{} ({})",
-                            hid_path(w).unwrap_or_else(|| "<unknown path>".to_string()),
-                            w.pretty_path
-                        ))
+                        .map(|d| d.path().to_string_lossy())
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
@@ -924,10 +875,20 @@ fn establish_session(
         },
     };
 
+    let device = info.open_device(&api).map_err(|_e| {
+        #[cfg(feature = "unsafe-debug")]
+        log::error!(
+            "cannot open Ledger at `{}`: {_e}",
+            info.path().to_string_lossy()
+        );
+        no_ledger_enumerated_error()
+    })?;
+    let mut ledger = LedgerWallet::new(device);
+    ledger.read_device(info).map_err(map_rw_err)?;
     let pubkey = ledger
         .get_pubkey(path, confirm_pubkey_on_device)
         .map_err(map_rw_err)?;
-    Ok((ledger, pubkey.to_bytes()))
+    Ok((Rc::new(ledger), pubkey.to_bytes()))
 }
 
 /// Host paths identify devices to a caller but are host-local detail, so they
@@ -1112,9 +1073,11 @@ fn unenumerated_detail(attached: &[u16], resolved: &str) -> String {
 /// so repeated `LedgerSigner::connect` calls do not re-enumerate HID. A device
 /// error drops only that device's session, so its next command re-establishes
 /// rather than reusing a handle to a device that has been unplugged, locked or
-/// switched apps. Dropping the last signer bound to a path releases its session.
+/// switched apps. Dropping the last signer bound to a host path closes that
+/// path's session.
 fn device_thread(cmd_rx: Receiver<DeviceCommand>) {
     let mut sessions: HashMap<Option<String>, Rc<LedgerWallet>> = HashMap::new();
+    let mut bindings: HashMap<Option<String>, usize> = HashMap::new();
 
     // Every command needs the caller's derivation path parsed; `connect` has
     // already validated it, so a failure here is genuinely unexpected.
@@ -1206,7 +1169,7 @@ fn device_thread(cmd_rx: Receiver<DeviceCommand>) {
                     &mut sessions,
                     &path_str,
                     host_device_path.as_deref(),
-                    |path, host| establish_session(path, false, host).map(|(wallet, _)| wallet),
+                    reestablish,
                     |wallet, path| {
                         wallet
                             .sign_message(path, &message)
@@ -1228,7 +1191,7 @@ fn device_thread(cmd_rx: Receiver<DeviceCommand>) {
                     &mut sessions,
                     &path_str,
                     host_device_path.as_deref(),
-                    |path, host| establish_session(path, false, host).map(|(wallet, _)| wallet),
+                    reestablish,
                     |wallet, path| {
                         wallet
                             .sign_offchain_message(path, &message)
@@ -1249,7 +1212,7 @@ fn device_thread(cmd_rx: Receiver<DeviceCommand>) {
                     &mut sessions,
                     &path_str,
                     host_device_path.as_deref(),
-                    |path, host| establish_session(path, false, host).map(|(wallet, _)| wallet),
+                    reestablish,
                     |wallet, path| wallet.get_pubkey(path, false).map_err(map_rw_err),
                 )
                 .is_ok();
@@ -1263,9 +1226,34 @@ fn device_thread(cmd_rx: Receiver<DeviceCommand>) {
                 let _ = reply.send(attached);
             }
 
-            DeviceCommand::Release { host_device_path } => {
-                sessions.remove(&host_device_path);
+            DeviceCommand::Bind { host_device_path } => {
+                bind(&mut bindings, host_device_path);
             }
+
+            DeviceCommand::Release { host_device_path } => {
+                release(&mut sessions, &mut bindings, host_device_path);
+            }
+        }
+    }
+}
+
+/// Count a connected signer on `host_device_path`.
+fn bind(bindings: &mut HashMap<Option<String>, usize>, host_device_path: Option<String>) {
+    *bindings.entry(host_device_path).or_default() += 1;
+}
+
+/// Count a dropped signer off `host_device_path`, and close that path's
+/// session once no signer is bound to it.
+fn release<W>(
+    sessions: &mut HashMap<Option<String>, W>,
+    bindings: &mut HashMap<Option<String>, usize>,
+    host_device_path: Option<String>,
+) {
+    match bindings.get_mut(&host_device_path) {
+        Some(bound) if *bound > 1 => *bound -= 1,
+        _ => {
+            bindings.remove(&host_device_path);
+            sessions.remove(&host_device_path);
         }
     }
 }
@@ -1339,11 +1327,12 @@ fn with_session<W, T>(
     result
 }
 
-/// The OS HID path of a Ledger wallet's own device handle. Recovered from the
-/// wallet's `hidapi` handle, matching what [`dashboard::ensure_solana_app_open`] uses.
-fn hid_path(wallet: &LedgerWallet) -> Option<String> {
-    let info = wallet.device.get_device_info().ok()?;
-    info.path().to_str().ok().map(str::to_string)
+/// The `establish` [`with_session`] passes for every signing-path command.
+fn reestablish(
+    path: &DerivationPath,
+    host_device_path: Option<&str>,
+) -> Result<Rc<LedgerWallet>, SignerError> {
+    establish_session(path, false, host_device_path).map(|(wallet, _)| wallet)
 }
 
 /// Extract the 64 raw bytes of a `solana-remote-wallet` signature so it can be
@@ -1777,34 +1766,26 @@ mod tests {
 
     #[test]
     fn dropping_the_last_signer_on_a_device_releases_only_its_session() {
-        let _guard = BUSY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (tx, rx) = mpsc::channel();
-        *CHANNEL_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
-        let released = || -> Vec<Option<String>> {
-            rx.try_iter()
-                .filter_map(|cmd| match cmd {
-                    DeviceCommand::Release { host_device_path } => Some(host_device_path),
-                    _ => None,
-                })
-                .collect()
-        };
-        let (a, b) = (Some("/a".to_string()), Some("/b".to_string()));
+        let (mut sessions, mut established) = (HashMap::new(), 0);
+        let a = Some("/a".to_string());
+        let b = run_on(&mut sessions, &mut established, Some("/b"), Ok(())).unwrap();
+        run_on(&mut sessions, &mut established, Some("/a"), Ok(())).unwrap();
+        let mut bindings = HashMap::new();
+        bind(&mut bindings, a.clone());
+        bind(&mut bindings, a.clone());
+        bind(&mut bindings, Some("/b".to_string()));
 
-        let (signer_a, bound_b) = (
-            DeviceBinding::bind(a.clone()),
-            DeviceBinding::bind(b.clone()),
+        release(&mut sessions, &mut bindings, a.clone());
+        assert!(
+            sessions.contains_key(&a),
+            "a second signer is still bound to /a"
         );
-        let in_flight_a = signer_a.clone();
-        drop(signer_a);
-        let early = released();
-        drop(in_flight_a);
-        let late = released();
-        drop(bound_b);
-        *CHANNEL_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        release(&mut sessions, &mut bindings, a.clone());
+        assert!(!sessions.contains_key(&a));
 
-        assert!(!early.contains(&a), "a command in flight still holds /a");
-        assert!(late.contains(&a));
-        assert!(!early.contains(&b) && !late.contains(&b));
+        let reused = run_on(&mut sessions, &mut established, Some("/b"), Ok(())).unwrap();
+        assert_eq!(reused, b);
+        assert_eq!(established, 2);
     }
 
     #[test]
@@ -1812,10 +1793,11 @@ mod tests {
         // Needed so a lost session re-establishes against the same Ledger
         // instead of whichever one happens to be attached. Constructed directly
         // because `connect` needs hardware; this pins the field's contract.
+        let _guard = BUSY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let signer = LedgerSigner {
             pubkey: Pubkey::from([1u8; 32]),
             path_str: DEFAULT_DERIVATION_PATH.to_string(),
-            device: DeviceBinding::bind(Some("/dev/hidraw3".to_string())),
+            host_device_path: Some("/dev/hidraw3".to_string()),
             signing_timeout: DEFAULT_SIGN_TIMEOUT,
         };
         assert_eq!(signer.host_device_path(), Some("/dev/hidraw3"));
@@ -1823,7 +1805,7 @@ mod tests {
         let sole = LedgerSigner {
             pubkey: Pubkey::from([2u8; 32]),
             path_str: DEFAULT_DERIVATION_PATH.to_string(),
-            device: DeviceBinding::bind(None),
+            host_device_path: None,
             signing_timeout: DEFAULT_SIGN_TIMEOUT,
         };
         assert_eq!(sole.host_device_path(), None);
@@ -2009,7 +1991,7 @@ mod tests {
                         DeviceCommand::IsAttached { reply } => {
                             let _ = reply.send(true);
                         }
-                        DeviceCommand::Release { .. } => {}
+                        DeviceCommand::Bind { .. } | DeviceCommand::Release { .. } => {}
                     }
                 }
             });
@@ -2040,7 +2022,7 @@ mod tests {
         LedgerSigner {
             pubkey,
             path_str: DEFAULT_DERIVATION_PATH.to_string(),
-            device: DeviceBinding::bind(None),
+            host_device_path: None,
             signing_timeout: Duration::from_secs(5),
         }
     }
@@ -2116,10 +2098,8 @@ mod tests {
     async fn a_busy_claim_refuses_a_signer_bound_to_another_device() {
         let (_device, pubkey) = FakeDevice::attach(15, false);
         let _held = DeviceClaim::acquire().expect("idle");
-        let signer = LedgerSigner {
-            device: DeviceBinding::bind(Some("/b".to_string())),
-            ..signer_for(pubkey)
-        };
+        let mut signer = signer_for(pubkey);
+        signer.host_device_path = Some("/b".to_string());
         let err = signer
             .sign_message(b"pay 1 SOL")
             .await
@@ -2225,6 +2205,7 @@ mod tests {
         }
 
         eprintln!("\n─── solana-remote-wallet, raw errors ───");
+        use solana_remote_wallet::remote_wallet::{initialize_wallet_manager, RemoteWalletType};
         match initialize_wallet_manager() {
             Err(e) => eprintln!("  initialize_wallet_manager: {e:?}"),
             Ok(manager) => {
