@@ -52,10 +52,11 @@
 
 mod dashboard;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::Arc;
 use std::time::Duration;
 
 use solana_derivation_path::DerivationPath;
@@ -195,9 +196,11 @@ enum DeviceCommand {
     /// Exists so callers never have to touch `hidapi` themselves; see
     /// [`device_channel`] for why that matters.
     IsAttached { reply: Sender<bool> },
-    /// The last signer bound to `host_device_path` was dropped; close its
-    /// session. Carries no claim: a drop cannot fail fast, and closing a handle
-    /// never waits on the user.
+    /// A signer was bound to `host_device_path`. Like `Release`, carries no
+    /// claim: neither touches the device.
+    Bind { host_device_path: Option<String> },
+    /// A signer bound to `host_device_path` was dropped; the last one closes
+    /// its session.
     Release { host_device_path: Option<String> },
 }
 
@@ -257,53 +260,28 @@ fn device_channel() -> &'static Sender<DeviceCommand> {
     })
 }
 
-/// Live [`DeviceBinding`]s per host path: one per signer and one per command in
-/// flight.
-static BOUND: std::sync::Mutex<BTreeMap<Option<String>, usize>> =
-    std::sync::Mutex::new(BTreeMap::new());
-
-/// A signer's hold on its `host_device_path`. Dropping the last one for a path
-/// sends [`DeviceCommand::Release`], so the device thread keeps no session that
-/// no live signer is bound to.
+/// A signer's hold on its `host_device_path`, counted by the device thread:
+/// [`DeviceCommand::Bind`] on creation, [`DeviceCommand::Release`] when the last
+/// clone drops. A command in flight holds a clone, so the release always
+/// reaches the thread after it.
 struct DeviceBinding {
     host_device_path: Option<String>,
 }
 
 impl DeviceBinding {
-    fn bind(host_device_path: Option<String>) -> Self {
-        *BOUND
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(host_device_path.clone())
-            .or_default() += 1;
-        Self { host_device_path }
-    }
-}
-
-/// A command in flight holds a clone, so a signer dropped before the command is
-/// sent cannot release the session ahead of it.
-impl Clone for DeviceBinding {
-    fn clone(&self) -> Self {
-        Self::bind(self.host_device_path.clone())
+    fn bind(host_device_path: Option<String>) -> Arc<Self> {
+        let _ = command_channel().send(DeviceCommand::Bind {
+            host_device_path: host_device_path.clone(),
+        });
+        Arc::new(Self { host_device_path })
     }
 }
 
 impl Drop for DeviceBinding {
     fn drop(&mut self) {
-        let mut bound = BOUND.lock().unwrap_or_else(|e| e.into_inner());
-        let count = bound
-            .get_mut(&self.host_device_path)
-            .expect("counted by bind");
-        *count -= 1;
-        if *count == 0 {
-            bound.remove(&self.host_device_path);
-            // Every command is sent while a binding is live, and this is sent
-            // under the lock, so it reaches the thread after every command for
-            // this path and ahead of the connect of any signer that rebinds it.
-            let _ = command_channel().send(DeviceCommand::Release {
-                host_device_path: self.host_device_path.take(),
-            });
-        }
+        let _ = command_channel().send(DeviceCommand::Release {
+            host_device_path: self.host_device_path.take(),
+        });
     }
 }
 
@@ -318,7 +296,7 @@ pub struct LedgerSigner {
     /// The device this signer was opened against, carried on every later
     /// command so a lost session re-establishes against the same one rather
     /// than whichever Ledger happens to be attached.
-    device: DeviceBinding,
+    device: Arc<DeviceBinding>,
     /// Timeout for the device commands that wait on a button press.
     signing_timeout: Duration,
 }
@@ -1115,6 +1093,7 @@ fn unenumerated_detail(attached: &[u16], resolved: &str) -> String {
 /// switched apps. Dropping the last signer bound to a path releases its session.
 fn device_thread(cmd_rx: Receiver<DeviceCommand>) {
     let mut sessions: HashMap<Option<String>, Rc<LedgerWallet>> = HashMap::new();
+    let mut bound: HashMap<Option<String>, usize> = HashMap::new();
 
     // Every command needs the caller's derivation path parsed; `connect` has
     // already validated it, so a failure here is genuinely unexpected.
@@ -1263,9 +1242,29 @@ fn device_thread(cmd_rx: Receiver<DeviceCommand>) {
                 let _ = reply.send(attached);
             }
 
-            DeviceCommand::Release { host_device_path } => {
-                sessions.remove(&host_device_path);
+            DeviceCommand::Bind { host_device_path } => {
+                *bound.entry(host_device_path).or_default() += 1;
             }
+
+            DeviceCommand::Release { host_device_path } => {
+                release(&mut sessions, &mut bound, host_device_path);
+            }
+        }
+    }
+}
+
+/// Count one signer off `host_device_path`, closing its session when none is
+/// left.
+fn release<W>(
+    sessions: &mut HashMap<Option<String>, W>,
+    bound: &mut HashMap<Option<String>, usize>,
+    host_device_path: Option<String>,
+) {
+    match bound.get_mut(&host_device_path) {
+        Some(count) if *count > 1 => *count -= 1,
+        _ => {
+            bound.remove(&host_device_path);
+            sessions.remove(&host_device_path);
         }
     }
 }
@@ -1780,31 +1779,40 @@ mod tests {
         let _guard = BUSY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tx, rx) = mpsc::channel();
         *CHANNEL_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
-        let released = || -> Vec<Option<String>> {
-            rx.try_iter()
-                .filter_map(|cmd| match cmd {
-                    DeviceCommand::Release { host_device_path } => Some(host_device_path),
-                    _ => None,
-                })
-                .collect()
+        let (mut sessions, mut established, mut bound) = (HashMap::new(), 0, HashMap::new());
+        let mut deliver = |sessions: &mut HashMap<Option<String>, usize>| {
+            for cmd in rx.try_iter() {
+                match cmd {
+                    DeviceCommand::Bind { host_device_path } => {
+                        *bound.entry(host_device_path).or_default() += 1;
+                    }
+                    DeviceCommand::Release { host_device_path } => {
+                        release(sessions, &mut bound, host_device_path);
+                    }
+                    _ => unreachable!("only bindings are sent"),
+                }
+            }
         };
         let (a, b) = (Some("/a".to_string()), Some("/b".to_string()));
 
-        let (signer_a, bound_b) = (
+        let (first_a, second_a) = (
             DeviceBinding::bind(a.clone()),
-            DeviceBinding::bind(b.clone()),
+            DeviceBinding::bind(a.clone()),
         );
-        let in_flight_a = signer_a.clone();
-        drop(signer_a);
-        let early = released();
-        drop(in_flight_a);
-        let late = released();
-        drop(bound_b);
+        let signer_b = DeviceBinding::bind(b.clone());
+        run_on(&mut sessions, &mut established, a.as_deref(), Ok(())).unwrap();
+        run_on(&mut sessions, &mut established, b.as_deref(), Ok(())).unwrap();
+        drop(first_a);
+        deliver(&mut sessions);
+        let kept_while_bound = sessions.contains_key(&a);
+        drop(second_a);
+        deliver(&mut sessions);
+        drop(signer_b);
         *CHANNEL_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
-        assert!(!early.contains(&a), "a command in flight still holds /a");
-        assert!(late.contains(&a));
-        assert!(!early.contains(&b) && !late.contains(&b));
+        assert!(kept_while_bound, "another signer still holds /a");
+        assert!(!sessions.contains_key(&a));
+        assert!(sessions.contains_key(&b));
     }
 
     #[test]
@@ -2009,7 +2017,7 @@ mod tests {
                         DeviceCommand::IsAttached { reply } => {
                             let _ = reply.send(true);
                         }
-                        DeviceCommand::Release { .. } => {}
+                        DeviceCommand::Bind { .. } | DeviceCommand::Release { .. } => {}
                     }
                 }
             });
