@@ -1208,7 +1208,6 @@ fn device_thread<H: Hardware>(hardware: H, cmd_rx: Receiver<DeviceCommand>) {
         hardware,
         open: HashMap::new(),
         bound: HashMap::new(),
-        sole: None,
     };
 
     // Every command needs the caller's derivation path parsed; `connect` has
@@ -1294,24 +1293,19 @@ struct Sessions<H: Hardware> {
     /// The signers that have used each host path. Kept apart from `open` so a
     /// rebuilt session stays bound to them; dead ones are pruned on release.
     bound: HashMap<String, Vec<Weak<Binding>>>,
-    /// The host path a `None` binding last resolved to.
-    sole: Option<String>,
 }
 
 impl<H: Hardware> Sessions<H> {
     /// The host paths `binding`'s device may answer at. A named binding uses the
     /// open session at its path or the one it last ran on; a `None` binding
-    /// uses the one a `None` binding last resolved to, if `cached`. Otherwise
-    /// this lists the interfaces of the named device, or of the sole one.
+    /// uses the one it last ran on, if `cached`. Otherwise this lists the
+    /// interfaces of the named device, or of the sole one.
     fn targets(&self, binding: &Binding, cached: bool) -> Result<Vec<String>, SignerError> {
         let held = match &binding.host_device_path {
             Some(path) => Some(path)
                 .filter(|path| self.open.contains_key(*path))
                 .or_else(|| self.last_run_on(binding)),
-            None => self
-                .sole
-                .as_ref()
-                .filter(|sole| cached && self.open.contains_key(*sole)),
+            None => self.last_run_on(binding).filter(|_| cached),
         };
         match held {
             Some(key) => Ok(vec![key.clone()]),
@@ -1384,9 +1378,6 @@ impl<H: Hardware> Sessions<H> {
             .is_err_and(|error| session_action(error) == SessionAction::Drop);
         if dropped {
             self.open.remove(&key);
-        }
-        if binding.host_device_path.is_none() {
-            self.sole = (!dropped).then_some(key);
         }
         result
     }
@@ -2874,6 +2865,57 @@ mod tests {
         rig.calls();
         drop(named);
         assert_eq!(rig.calls(), ["close /a"], "the unnamed signer left /a");
+    }
+
+    #[tokio::test]
+    async fn an_unnamed_signer_keeps_its_device() {
+        let rig = Rig::attach(&["/a"]);
+        let a = connect(quiet(None));
+        rig.hardware.bench().attached = vec![vec!["/b".to_string()]];
+        let _b = connect(quiet(None));
+        rig.hardware.bench().attached.push(vec!["/a".to_string()]);
+        rig.calls();
+        sign(&a).await.expect("signs on A");
+        assert_eq!(rig.calls(), ["sign /a"]);
+    }
+
+    #[tokio::test]
+    async fn an_unnamed_signer_refuses_another_device() {
+        let rig = Rig::attach(&["/a"]);
+        let a = connect(quiet(None));
+        rig.hardware.bench().faulty.push("/a".to_string());
+        sign(&a).await.expect_err("the device was lost");
+        rig.hardware.bench().attached = vec![vec!["/b".to_string()]];
+        let _b = connect(quiet(None));
+        rig.hardware.bench().attached.push(vec!["/a".to_string()]);
+        rig.calls();
+        let err = sign(&a).await.expect_err("two Ledgers attached");
+        assert_eq!(
+            err.detail_string(),
+            multiple_devices_error(2).detail_string()
+        );
+        assert_eq!(rig.calls(), ["resolve"]);
+    }
+
+    #[tokio::test]
+    async fn unnamed_signers_share_a_session() {
+        let rig = Rig::attach(&["/a"]);
+        let first = connect(quiet(None));
+        let second = connect(quiet(None));
+        sign(&first).await.expect("signs");
+        sign(&second).await.expect("signs");
+        assert_eq!(
+            rig.calls(),
+            [
+                "resolve",
+                "open /a",
+                "pubkey /a",
+                "resolve",
+                "pubkey /a",
+                "sign /a",
+                "sign /a"
+            ]
+        );
     }
 
     fn attach_two_interfaces() -> Rig {
