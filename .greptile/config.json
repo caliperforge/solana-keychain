@@ -1,0 +1,26 @@
+{
+  "autoReview": [],
+  "strictness": 2,
+  "customContext": {
+    "files": [
+      {
+        "path": "go/core/txutil.go",
+        "scope": [
+          "**"
+        ]
+      },
+      {
+        "path": "rust/src/transaction_util.rs",
+        "scope": [
+          "**"
+        ]
+      },
+      {
+        "path": "python/src/solana_keychain/core/transaction_util.py",
+        "scope": [
+          "**"
+        ]
+      }
+    ]
+  }
+}
