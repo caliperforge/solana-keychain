@@ -111,7 +111,7 @@ pub fn ensure_solana_app_open(host_device_path: Option<&str>) -> Result<bool, Si
 /// Paths may name different interfaces of the same device. Prefix matching
 /// requires 80% common prefix ending on delimiter, accepting only if exactly
 /// one matches. Ambiguity returns `None`, never an arbitrary device.
-fn select_ledger(available: &[&str], want: &str) -> Option<usize> {
+pub(super) fn select_ledger(available: &[&str], want: &str) -> Option<usize> {
     if let Some(exact) = available.iter().position(|p| *p == want) {
         return Some(exact);
     }
