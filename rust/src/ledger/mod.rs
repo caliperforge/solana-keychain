@@ -1294,7 +1294,7 @@ fn device_thread<H: Hardware>(hardware: H, cmd_rx: Receiver<DeviceCommand>) {
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
             DeviceCommand::Connect {
-                claim: _claim,
+                claim,
                 path_str,
                 confirm_pubkey_on_device,
                 binding,
@@ -1304,11 +1304,13 @@ fn device_thread<H: Hardware>(hardware: H, cmd_rx: Receiver<DeviceCommand>) {
                 let result = parse(&path_str).and_then(|path| {
                     sessions.connect(&binding, &path, confirm_pubkey_on_device, auto_open_app)
                 });
+                drop(claim);
+                drop(binding);
                 let _ = reply.send(result);
             }
 
             DeviceCommand::SignTransactionMessage {
-                claim: _claim,
+                claim,
                 path_str,
                 message,
                 binding,
@@ -1320,11 +1322,13 @@ fn device_thread<H: Hardware>(hardware: H, cmd_rx: Receiver<DeviceCommand>) {
                         hardware.sign_transaction(wallet, &path, &message)
                     })
                 });
+                drop(claim);
+                drop(binding);
                 let _ = reply.send(result);
             }
 
             DeviceCommand::SignOffchainMessage {
-                claim: _claim,
+                claim,
                 path_str,
                 message,
                 binding,
@@ -1336,11 +1340,13 @@ fn device_thread<H: Hardware>(hardware: H, cmd_rx: Receiver<DeviceCommand>) {
                         hardware.sign_offchain(wallet, &path, &message)
                     })
                 });
+                drop(claim);
+                drop(binding);
                 let _ = reply.send(result);
             }
 
             DeviceCommand::IsAvailable {
-                claim: _claim,
+                claim,
                 path_str,
                 binding,
                 pubkey,
@@ -1351,6 +1357,8 @@ fn device_thread<H: Hardware>(hardware: H, cmd_rx: Receiver<DeviceCommand>) {
                         checked.map_or_else(|| hardware.pubkey(wallet, &path, false), Ok)
                     })
                 });
+                drop(claim);
+                drop(binding);
                 let _ = reply.send(result);
             }
 
@@ -2661,8 +2669,8 @@ mod tests {
         }
     }
 
-    /// Wait for the device thread to drop the last command and its claim,
-    /// which it does after replying.
+    /// Wait for the device thread to drop the last command's claim and binding,
+    /// which it does before replying.
     fn idle() -> bool {
         (0..1000).any(|_| {
             let free = DeviceClaim::try_acquire().is_some();
@@ -2701,6 +2709,16 @@ mod tests {
     async fn sign(signer: &LedgerSigner) -> Result<Signature, SignerError> {
         assert!(idle(), "the device thread kept its claim");
         signer.sign_message(b"pay 1 SOL").await
+    }
+
+    #[test]
+    fn a_replied_caller_can_claim_the_device_at_once() {
+        let _rig = Rig::attach(&["/a"]);
+        for _ in 0..1000 {
+            LedgerSigner::connect_with(quiet(Some("/a")))
+                .map_err(|err| err.detail_string())
+                .expect("the device is free");
+        }
     }
 
     #[tokio::test]
