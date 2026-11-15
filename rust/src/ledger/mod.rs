@@ -1294,7 +1294,7 @@ fn device_thread<H: Hardware>(hardware: H, cmd_rx: Receiver<DeviceCommand>) {
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
             DeviceCommand::Connect {
-                claim: _claim,
+                claim,
                 path_str,
                 confirm_pubkey_on_device,
                 binding,
@@ -1304,11 +1304,13 @@ fn device_thread<H: Hardware>(hardware: H, cmd_rx: Receiver<DeviceCommand>) {
                 let result = parse(&path_str).and_then(|path| {
                     sessions.connect(&binding, &path, confirm_pubkey_on_device, auto_open_app)
                 });
+                // Freed before replying, so a caller holding its reply can claim again.
+                drop(claim);
                 let _ = reply.send(result);
             }
 
             DeviceCommand::SignTransactionMessage {
-                claim: _claim,
+                claim,
                 path_str,
                 message,
                 binding,
@@ -1320,11 +1322,12 @@ fn device_thread<H: Hardware>(hardware: H, cmd_rx: Receiver<DeviceCommand>) {
                         hardware.sign_transaction(wallet, &path, &message)
                     })
                 });
+                drop(claim);
                 let _ = reply.send(result);
             }
 
             DeviceCommand::SignOffchainMessage {
-                claim: _claim,
+                claim,
                 path_str,
                 message,
                 binding,
@@ -1336,11 +1339,12 @@ fn device_thread<H: Hardware>(hardware: H, cmd_rx: Receiver<DeviceCommand>) {
                         hardware.sign_offchain(wallet, &path, &message)
                     })
                 });
+                drop(claim);
                 let _ = reply.send(result);
             }
 
             DeviceCommand::IsAvailable {
-                claim: _claim,
+                claim,
                 path_str,
                 binding,
                 pubkey,
@@ -1351,6 +1355,7 @@ fn device_thread<H: Hardware>(hardware: H, cmd_rx: Receiver<DeviceCommand>) {
                         checked.map_or_else(|| hardware.pubkey(wallet, &path, false), Ok)
                     })
                 });
+                drop(claim);
                 let _ = reply.send(result);
             }
 
@@ -2662,7 +2667,7 @@ mod tests {
     }
 
     /// Wait for the device thread to drop the last command and its claim,
-    /// which it does after replying.
+    /// which it does before replying.
     fn idle() -> bool {
         (0..1000).any(|_| {
             let free = DeviceClaim::try_acquire().is_some();
@@ -2713,6 +2718,17 @@ mod tests {
         assert_eq!(rig.calls(), ["close /a"]);
         sign(&b).await.expect("its session is kept");
         assert_eq!(rig.calls(), ["sign /b"]);
+    }
+
+    #[test]
+    fn a_replied_caller_can_claim_the_device_at_once() {
+        let _rig = Rig::attach(&["/a"]);
+        let _held = connect(quiet(Some("/a")));
+        for _ in 0..1000 {
+            LedgerSigner::connect_with(quiet(Some("/a")))
+                .map_err(|e| e.detail_string())
+                .expect("the claim was freed");
+        }
     }
 
     #[tokio::test]
