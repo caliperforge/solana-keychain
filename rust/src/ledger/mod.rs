@@ -1304,8 +1304,8 @@ fn device_thread<H: Hardware>(hardware: H, cmd_rx: Receiver<DeviceCommand>) {
                 let result = parse(&path_str).and_then(|path| {
                     sessions.connect(&binding, &path, confirm_pubkey_on_device, auto_open_app)
                 });
-                drop(claim);
                 drop(binding);
+                drop(claim);
                 let _ = reply.send(result);
             }
 
@@ -1322,8 +1322,8 @@ fn device_thread<H: Hardware>(hardware: H, cmd_rx: Receiver<DeviceCommand>) {
                         hardware.sign_transaction(wallet, &path, &message)
                     })
                 });
-                drop(claim);
                 drop(binding);
+                drop(claim);
                 let _ = reply.send(result);
             }
 
@@ -1340,8 +1340,8 @@ fn device_thread<H: Hardware>(hardware: H, cmd_rx: Receiver<DeviceCommand>) {
                         hardware.sign_offchain(wallet, &path, &message)
                     })
                 });
-                drop(claim);
                 drop(binding);
+                drop(claim);
                 let _ = reply.send(result);
             }
 
@@ -1357,8 +1357,8 @@ fn device_thread<H: Hardware>(hardware: H, cmd_rx: Receiver<DeviceCommand>) {
                         checked.map_or_else(|| hardware.pubkey(wallet, &path, false), Ok)
                     })
                 });
-                drop(claim);
                 drop(binding);
+                drop(claim);
                 let _ = reply.send(result);
             }
 
@@ -2669,7 +2669,7 @@ mod tests {
         }
     }
 
-    /// Wait for the device thread to drop the last command's claim and binding,
+    /// Wait for the device thread to drop the last command and its claim,
     /// which it does before replying.
     fn idle() -> bool {
         (0..1000).any(|_| {
@@ -2709,16 +2709,6 @@ mod tests {
     async fn sign(signer: &LedgerSigner) -> Result<Signature, SignerError> {
         assert!(idle(), "the device thread kept its claim");
         signer.sign_message(b"pay 1 SOL").await
-    }
-
-    #[test]
-    fn a_replied_caller_can_claim_the_device_at_once() {
-        let _rig = Rig::attach(&["/a"]);
-        for _ in 0..1000 {
-            LedgerSigner::connect_with(quiet(Some("/a")))
-                .map_err(|err| err.detail_string())
-                .expect("the device is free");
-        }
     }
 
     #[tokio::test]
@@ -4172,5 +4162,35 @@ mod tests {
             "got: {err:?}"
         );
         assert_eq!(rig.calls(), ["pubkey /a", "close /a", "open /a"]);
+    }
+
+    #[test]
+    fn an_answered_caller_can_claim_again_at_once() {
+        let rig = Rig::attach(&["/a"]);
+        let signer = connect(quiet(Some("/a")));
+        for _ in 0..1000 {
+            let claim = DeviceClaim::acquire().expect("the claim is freed before the reply");
+            let (reply, answered) = mpsc::channel();
+            rig.tx
+                .send(DeviceCommand::IsAvailable {
+                    claim,
+                    path_str: signer.path_str.clone(),
+                    binding: Arc::clone(&signer.binding),
+                    pubkey: signer.pubkey.to_bytes(),
+                    reply,
+                })
+                .expect("the device thread runs");
+            loop {
+                match answered.try_recv() {
+                    Err(mpsc::TryRecvError::Empty) => std::hint::spin_loop(),
+                    answer => {
+                        answer
+                            .expect("the device thread answers")
+                            .expect("the probe passes");
+                        break;
+                    }
+                }
+            }
+        }
     }
 }
