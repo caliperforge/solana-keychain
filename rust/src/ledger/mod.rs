@@ -4191,6 +4191,11 @@ mod tests {
                     }
                 }
             }
+            assert_eq!(
+                Arc::strong_count(&signer.binding),
+                1,
+                "the binding is freed before the reply"
+            );
         }
     }
 }
